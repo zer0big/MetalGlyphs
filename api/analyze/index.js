@@ -108,7 +108,7 @@ Structure:
                     { role: 'user', content: `Artist: ${artist}, Song: ${song}` }
                 ],
                 temperature: 0.7,
-                max_tokens: 4000
+                max_tokens: 3000
             })
         });
 
