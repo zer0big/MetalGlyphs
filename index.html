@@ -63,12 +63,12 @@
         // AZURE WELL-ARCHITECTED FRAMEWORK - RELIABILITY PATTERNS
         // ============================================================
 
-        // 1. API Key Management
-        const getApiKey = () => {
-            if (typeof window !== 'undefined' && window.ENV && window.ENV.GEMINI_API_KEY) {
-                return window.ENV.GEMINI_API_KEY;
-            }
-            return "AIzaSyBgCRTZEvFetL2607KA7Ycl5zEF-kOe8GE";
+        // 1. AZURE OPENAI CONFIGURATION
+        const AZURE_OPENAI_CONFIG = {
+            endpoint: 'https://zerobig-aoi.openai.azure.com',
+            apiKey: '18a97f5864e24ee2ac9e5b7050803e1a',
+            deploymentName: 'gpt-4o',
+            apiVersion: '2024-08-06'
         };
 
         // 2. CIRCUIT BREAKER PATTERN (Azure WAF RE:07 Self-preservation)
@@ -378,11 +378,6 @@
 
         // 8. MAIN API FUNCTIONS
         const generateContent = async (artist, song, onProgress) => {
-            const activeApiKey = getApiKey();
-            if (!activeApiKey) {
-                throw new Error("API Key is missing.");
-            }
-
             // Check cache first
             const cached = CacheManager.get(artist, song);
             if (cached) {
@@ -396,7 +391,7 @@
                 throw new Error(circuitStatus.reason);
             }
 
-            onProgress?.('🎵 AI 분석 중...');
+            onProgress?.('🎵 Azure OpenAI 분석 중...');
 
             const systemPrompt = `
 You are the "ZEORBIG Metal Analysis Engine". Your goal is to analyze a song and provide structured data.
@@ -437,20 +432,26 @@ Structure:
             `;
 
             const response = await resilientFetch(
-                `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent?key=${activeApiKey}`,
+                `${AZURE_OPENAI_CONFIG.endpoint}/openai/deployments/${AZURE_OPENAI_CONFIG.deploymentName}/chat/completions?api-version=${AZURE_OPENAI_CONFIG.apiVersion}`,
                 {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
+                    headers: { 
+                        'Content-Type': 'application/json',
+                        'api-key': AZURE_OPENAI_CONFIG.apiKey
+                    },
                     body: JSON.stringify({
-                        contents: [{ parts: [{ text: `Artist: ${artist}, Song: ${song}` }] }],
-                        systemInstruction: { parts: [{ text: systemPrompt }] }
-                        // google_search removed to reduce API complexity and rate limiting
+                        messages: [
+                            { role: 'system', content: systemPrompt },
+                            { role: 'user', content: `Artist: ${artist}, Song: ${song}` }
+                        ],
+                        temperature: 0.7,
+                        max_tokens: 4000
                     })
                 }
             );
 
             const data = await response.json();
-            let textContent = data.candidates?.[0]?.content?.parts?.[0]?.text;
+            let textContent = data.choices?.[0]?.message?.content;
             
             if (!textContent) throw new Error("No content generated");
 
