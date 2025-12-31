@@ -39,7 +39,7 @@
     <div id="root"></div>
 
     <script type="text/babel">
-        const { useState } = React;
+        const { useState, useEffect } = React;
 
         // --- Icons (Embedded SVG) ---
         const Icon = ({ path, className = "w-6 h-6" }) => (
@@ -59,72 +59,211 @@
             ExternalLink: (props) => <Icon {...props} path='<path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/>' />,
         };
 
-        // IMPORTANT: For Azure deployment, replace this with environment variable
-        // In Azure Static Web Apps, use Application Settings to set GEMINI_API_KEY
+        // ============================================================
+        // AZURE WELL-ARCHITECTED FRAMEWORK - RELIABILITY PATTERNS
+        // ============================================================
+
+        // 1. API Key Management
         const getApiKey = () => {
-            // Check if environment variable is available (Azure deployment)
             if (typeof window !== 'undefined' && window.ENV && window.ENV.GEMINI_API_KEY) {
                 return window.ENV.GEMINI_API_KEY;
             }
-            // Fallback to hardcoded key for local development
             return "AIzaSyBwJ7Oxw1VYAXi6dsXpP1iA3qwb5Aw8OuQ";
         };
 
-        // Rate Limiter - 429 에러 방지를 위한 전역 API 호출 제한
-        const RateLimiter = {
-            lastCallTime: 0,
-            minInterval: 15000, // 최소 15초 간격
+        // 2. CIRCUIT BREAKER PATTERN (Azure WAF RE:07 Self-preservation)
+        // States: CLOSED → OPEN → HALF_OPEN → CLOSED
+        const CircuitBreaker = {
+            state: 'CLOSED', // CLOSED, OPEN, HALF_OPEN
+            failureCount: 0,
+            successCount: 0,
+            lastFailureTime: 0,
             
-            async waitIfNeeded() {
+            // Configuration
+            FAILURE_THRESHOLD: 2,      // 2번 실패하면 OPEN
+            SUCCESS_THRESHOLD: 1,      // 1번 성공하면 CLOSED
+            TIMEOUT_MS: 120000,        // 2분 후 HALF_OPEN으로 전환
+            
+            canRequest() {
                 const now = Date.now();
-                const timeSinceLastCall = now - this.lastCallTime;
                 
-                if (timeSinceLastCall < this.minInterval) {
-                    const waitTime = this.minInterval - timeSinceLastCall;
-                    console.log(`⏱️ Rate limit protection: waiting ${Math.round(waitTime/1000)}s before API call...`);
-                    await wait(waitTime);
+                if (this.state === 'CLOSED') {
+                    return { allowed: true, reason: null };
                 }
                 
-                this.lastCallTime = Date.now();
+                if (this.state === 'OPEN') {
+                    const elapsed = now - this.lastFailureTime;
+                    if (elapsed >= this.TIMEOUT_MS) {
+                        console.log('🔄 Circuit Breaker: OPEN → HALF_OPEN (timeout elapsed)');
+                        this.state = 'HALF_OPEN';
+                        this.successCount = 0;
+                        return { allowed: true, reason: 'Testing after timeout' };
+                    }
+                    const remainingSeconds = Math.ceil((this.TIMEOUT_MS - elapsed) / 1000);
+                    return { 
+                        allowed: false, 
+                        reason: `🛑 API 보호 모드: ${remainingSeconds}초 후 자동 재시도됩니다.`
+                    };
+                }
+                
+                if (this.state === 'HALF_OPEN') {
+                    return { allowed: true, reason: 'Testing connection' };
+                }
+                
+                return { allowed: true, reason: null };
+            },
+            
+            recordSuccess() {
+                if (this.state === 'HALF_OPEN') {
+                    this.successCount++;
+                    if (this.successCount >= this.SUCCESS_THRESHOLD) {
+                        console.log('✅ Circuit Breaker: HALF_OPEN → CLOSED');
+                        this.state = 'CLOSED';
+                        this.failureCount = 0;
+                        this.successCount = 0;
+                    }
+                } else if (this.state === 'CLOSED') {
+                    this.failureCount = 0; // Reset on success
+                }
+            },
+            
+            recordFailure() {
+                this.failureCount++;
+                this.lastFailureTime = Date.now();
+                
+                if (this.state === 'HALF_OPEN') {
+                    console.log('❌ Circuit Breaker: HALF_OPEN → OPEN');
+                    this.state = 'OPEN';
+                    this.successCount = 0;
+                } else if (this.state === 'CLOSED' && this.failureCount >= this.FAILURE_THRESHOLD) {
+                    console.log(`🚨 Circuit Breaker: CLOSED → OPEN (${this.failureCount} failures)`);
+                    this.state = 'OPEN';
+                }
+            },
+            
+            getStatus() {
+                return {
+                    state: this.state,
+                    failures: this.failureCount,
+                    timeUntilRetry: this.state === 'OPEN' 
+                        ? Math.max(0, this.TIMEOUT_MS - (Date.now() - this.lastFailureTime))
+                        : 0
+                };
+            },
+            
+            reset() {
+                this.state = 'CLOSED';
+                this.failureCount = 0;
+                this.successCount = 0;
+                this.lastFailureTime = 0;
+                console.log('🔧 Circuit Breaker: Manual reset');
             }
         };
 
-        // Cache Manager - 중복 요청 방지
+        // 3. TOKEN BUCKET RATE LIMITER (More precise than simple interval)
+        const TokenBucket = {
+            tokens: 10,              // Max tokens
+            maxTokens: 10,
+            refillRate: 1,           // 1 token per 10 seconds
+            refillIntervalMs: 10000,
+            lastRefillTime: Date.now(),
+            
+            refill() {
+                const now = Date.now();
+                const elapsed = now - this.lastRefillTime;
+                const tokensToAdd = Math.floor(elapsed / this.refillIntervalMs) * this.refillRate;
+                
+                if (tokensToAdd > 0) {
+                    this.tokens = Math.min(this.maxTokens, this.tokens + tokensToAdd);
+                    this.lastRefillTime = now;
+                }
+            },
+            
+            tryConsume(count = 1) {
+                this.refill();
+                
+                if (this.tokens >= count) {
+                    this.tokens -= count;
+                    console.log(`🪙 Token consumed. Remaining: ${this.tokens}/${this.maxTokens}`);
+                    return true;
+                }
+                
+                console.log(`⚠️ Not enough tokens. Available: ${this.tokens}/${this.maxTokens}`);
+                return false;
+            },
+            
+            getWaitTime() {
+                if (this.tokens > 0) return 0;
+                this.refill();
+                if (this.tokens > 0) return 0;
+                return this.refillIntervalMs;
+            }
+        };
+
+        // 4. EXPONENTIAL BACKOFF WITH JITTER (Azure WAF Best Practice)
+        const calculateBackoff = (attemptNumber, baseDelayMs = 1000, maxDelayMs = 120000) => {
+            // Exponential component
+            const exponentialDelay = Math.min(maxDelayMs, baseDelayMs * Math.pow(2, attemptNumber));
+            
+            // Jitter: Add random variance (0-50% of delay)
+            const jitter = exponentialDelay * Math.random() * 0.5;
+            
+            return Math.round(exponentialDelay + jitter);
+        };
+
+        // 5. CACHE MANAGER with TTL
         const CacheManager = {
-            get(key) {
+            CACHE_TTL_MS: 7200000, // 2 hours
+            
+            _getKey(artist, song) {
+                return `metal_cache_${artist.toLowerCase().trim()}_${song.toLowerCase().trim()}`;
+            },
+            
+            get(artist, song) {
                 try {
-                    const cached = localStorage.getItem(`metal_cache_${key}`);
+                    const key = this._getKey(artist, song);
+                    const cached = localStorage.getItem(key);
                     if (!cached) return null;
                     
                     const data = JSON.parse(cached);
                     const age = Date.now() - data.timestamp;
                     
-                    // 1시간 캐시
-                    if (age < 3600000) {
-                        console.log('✅ Using cached result');
+                    if (age < this.CACHE_TTL_MS) {
+                        console.log(`✅ Cache HIT (age: ${Math.round(age/60000)}min)`);
                         return data.value;
                     }
                     
-                    localStorage.removeItem(`metal_cache_${key}`);
+                    console.log('♻️ Cache expired, removing...');
+                    localStorage.removeItem(key);
                 } catch (e) {
                     console.error('Cache read error:', e);
                 }
                 return null;
             },
             
-            set(key, value) {
+            set(artist, song, value) {
                 try {
-                    localStorage.setItem(`metal_cache_${key}`, JSON.stringify({
+                    const key = this._getKey(artist, song);
+                    localStorage.setItem(key, JSON.stringify({
                         value,
                         timestamp: Date.now()
                     }));
+                    console.log('💾 Result cached');
                 } catch (e) {
                     console.error('Cache write error:', e);
                 }
+            },
+            
+            clear() {
+                const keys = Object.keys(localStorage).filter(k => k.startsWith('metal_cache_'));
+                keys.forEach(k => localStorage.removeItem(k));
+                console.log(`🧹 Cleared ${keys.length} cached entries`);
             }
         };
 
-        // --- Helper Functions ---
+        // 6. HELPER FUNCTIONS
+        const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
         const sanitizeData = (raw) => {
             const asString = (val, defaultText = "") => {
                 if (val === null || val === undefined) return defaultText;
@@ -132,17 +271,12 @@
                 if (typeof val === 'number') return String(val);
                 if (Array.isArray(val)) return val.join('\n');
                 if (typeof val === 'object') {
-                    try {
-                        return JSON.stringify(val);
-                    } catch (e) {
-                        return defaultText;
-                    }
+                    try { return JSON.stringify(val); } catch (e) { return defaultText; }
                 }
                 return defaultText;
             };
 
             const rawLinks = raw?.externalLinks || {};
-
             return {
                 isMetal: typeof raw?.isMetal === 'boolean' ? raw.isMetal : true,
                 lyricsOriginal: asString(raw?.lyricsOriginal, "Lyrics not found."),
@@ -160,59 +294,109 @@
             };
         };
 
-        const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-
-        const fetchWithRetry = async (url, options, retries = 3, delay = 5000) => {
-            try {
-                const response = await fetch(url, options);
-                
-                if (response.status === 429) {
-                    // Rate limit error - MUCH longer wait time
-                    const retryAfter = response.headers.get('Retry-After');
-                    const waitTime = retryAfter ? parseInt(retryAfter) * 1000 : Math.max(delay, 60000); // 최소 60초
-                    
-                    if (retries === 0) {
-                        throw new Error(`🚫 API 요청 한도 초과: Google API의 무료 티어 한도에 도달했습니다. ${Math.round(waitTime/1000)}초 후 다시 시도하거나, 잠시 후 새로고침 해주세요.`);
+        // 7. RESILIENT FETCH with Circuit Breaker + Exponential Backoff + Jitter
+        const resilientFetch = async (url, options, maxRetries = 2) => {
+            let lastError;
+            
+            for (let attempt = 0; attempt <= maxRetries; attempt++) {
+                try {
+                    // Check circuit breaker
+                    const circuitStatus = CircuitBreaker.canRequest();
+                    if (!circuitStatus.allowed) {
+                        throw new Error(circuitStatus.reason);
                     }
                     
-                    console.warn(`⚠️ 429 Rate limit! Waiting ${Math.round(waitTime/1000)}s...`);
-                    await wait(waitTime);
-                    return fetchWithRetry(url, options, retries - 1, waitTime * 1.5);
+                    // Check token bucket
+                    if (!TokenBucket.tryConsume()) {
+                        const waitTime = TokenBucket.getWaitTime();
+                        console.log(`⏳ Rate limit: waiting ${waitTime/1000}s for token...`);
+                        await wait(waitTime);
+                        TokenBucket.tryConsume();
+                    }
+                    
+                    const response = await fetch(url, options);
+                    
+                    if (response.status === 429) {
+                        const retryAfter = response.headers.get('Retry-After');
+                        const serverWait = retryAfter ? parseInt(retryAfter) * 1000 : null;
+                        
+                        CircuitBreaker.recordFailure();
+                        
+                        if (attempt < maxRetries) {
+                            const backoff = serverWait || calculateBackoff(attempt, 30000, 120000);
+                            console.warn(`⚠️ 429 Rate limit. Attempt ${attempt + 1}/${maxRetries + 1}. Waiting ${Math.round(backoff/1000)}s...`);
+                            await wait(backoff);
+                            continue;
+                        }
+                        
+                        throw new Error(`API_RATE_LIMIT`);
+                    }
+                    
+                    if (response.status >= 500) {
+                        CircuitBreaker.recordFailure();
+                        
+                        if (attempt < maxRetries) {
+                            const backoff = calculateBackoff(attempt, 5000, 60000);
+                            console.warn(`⚠️ Server error ${response.status}. Retrying in ${Math.round(backoff/1000)}s...`);
+                            await wait(backoff);
+                            continue;
+                        }
+                        
+                        throw new Error(`Server error: ${response.status}`);
+                    }
+                    
+                    if (!response.ok) {
+                        const errorText = await response.text();
+                        throw new Error(`API Error (${response.status}): ${errorText.slice(0, 200)}`);
+                    }
+                    
+                    // Success!
+                    CircuitBreaker.recordSuccess();
+                    return response;
+                    
+                } catch (error) {
+                    lastError = error;
+                    
+                    // Don't retry on circuit breaker blocks or known fatal errors
+                    if (error.message.includes('보호 모드') || 
+                        error.message === 'API_RATE_LIMIT' ||
+                        error.message.includes('API Key')) {
+                        break;
+                    }
+                    
+                    // Network error - retry with backoff
+                    if (attempt < maxRetries) {
+                        const backoff = calculateBackoff(attempt, 3000, 30000);
+                        console.warn(`🌐 Network error. Retrying in ${Math.round(backoff/1000)}s...`);
+                        await wait(backoff);
+                    }
                 }
-                
-                if (!response.ok && response.status >= 500) {
-                    throw new Error(`Server error: ${response.status}`);
-                }
-                
-                return response;
-            } catch (error) {
-                if (retries === 0) throw error;
-                
-                // For network errors or other issues
-                if (!error.message.includes('429') && !error.message.includes('한도')) {
-                    await wait(delay);
-                    return fetchWithRetry(url, options, retries - 1, delay * 2);
-                }
-                throw error; // Re-throw 429 errors
             }
+            
+            throw lastError;
         };
 
-        const generateContent = async (artist, song) => {
+        // 8. MAIN API FUNCTIONS
+        const generateContent = async (artist, song, onProgress) => {
             const activeApiKey = getApiKey();
-            
             if (!activeApiKey) {
-                throw new Error("API Key is missing. Please check system configuration.");
+                throw new Error("API Key is missing.");
             }
 
-            // 캐시 확인
-            const cacheKey = `${artist.toLowerCase()}_${song.toLowerCase()}`;
-            const cached = CacheManager.get(cacheKey);
+            // Check cache first
+            const cached = CacheManager.get(artist, song);
             if (cached) {
+                onProgress?.('💾 캐시에서 로드 완료!');
                 return cached;
             }
 
-            // Rate Limiter 체크
-            await RateLimiter.waitIfNeeded();
+            // Check circuit breaker before any API call
+            const circuitStatus = CircuitBreaker.canRequest();
+            if (!circuitStatus.allowed) {
+                throw new Error(circuitStatus.reason);
+            }
+
+            onProgress?.('🎵 AI 분석 중...');
 
             const systemPrompt = `
 You are the "ZEORBIG Metal Analysis Engine". Your goal is to analyze a song and provide structured data.
@@ -252,84 +436,78 @@ Structure:
 }
             `;
 
-            const userPrompt = `Artist: ${artist}, Song: ${song}`;
-
-            try {
-                const response = await fetchWithRetry(
-                    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=${activeApiKey}`,
-                    {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            contents: [{ parts: [{ text: userPrompt }] }],
-                            systemInstruction: { parts: [{ text: systemPrompt }] },
-                            tools: [{ google_search: {} }]
-                        })
-                    }
-                );
-
-                if (!response.ok) {
-                    const errorText = await response.text();
-                    let detailedMsg = "";
-                    try {
-                        const errorJson = JSON.parse(errorText);
-                        detailedMsg = errorJson.error?.message || errorText;
-                    } catch (e) {
-                        detailedMsg = errorText;
-                    }
-                    throw new Error(`Gemini API Error (${response.status}): ${detailedMsg}`);
+            const response = await resilientFetch(
+                `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=${activeApiKey}`,
+                {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        contents: [{ parts: [{ text: `Artist: ${artist}, Song: ${song}` }] }],
+                        systemInstruction: { parts: [{ text: systemPrompt }] },
+                        tools: [{ google_search: {} }]
+                    })
                 }
-                
-                const data = await response.json();
-                let textContent = data.candidates?.[0]?.content?.parts?.[0]?.text;
-                
-                if (!textContent) throw new Error("No content generated");
+            );
 
-                const jsonStart = textContent.indexOf('{');
-                const jsonEnd = textContent.lastIndexOf('}');
-                
-                if (jsonStart !== -1 && jsonEnd !== -1) {
-                    textContent = textContent.substring(jsonStart, jsonEnd + 1);
-                } else {
-                    throw new Error("Failed to parse JSON structure from model response.");
-                }
-                
-                let parsedData;
-                try {
-                    parsedData = JSON.parse(textContent);
-                } catch (e) {
-                    console.error("JSON Parse Error", e);
-                    throw new Error("Invalid JSON received from AI model.");
-                }
+            const data = await response.json();
+            let textContent = data.candidates?.[0]?.content?.parts?.[0]?.text;
+            
+            if (!textContent) throw new Error("No content generated");
 
-                const sanitized = sanitizeData(parsedData);
-                
-                // 결과 캐싱
-                CacheManager.set(cacheKey, sanitized);
-                
-                return sanitized;
-
-            } catch (error) {
-                console.error("Text Generation Failed", error);
-                throw error;
+            const jsonStart = textContent.indexOf('{');
+            const jsonEnd = textContent.lastIndexOf('}');
+            
+            if (jsonStart !== -1 && jsonEnd !== -1) {
+                textContent = textContent.substring(jsonStart, jsonEnd + 1);
+            } else {
+                throw new Error("Failed to parse JSON from model response.");
             }
+            
+            let parsedData;
+            try {
+                parsedData = JSON.parse(textContent);
+            } catch (e) {
+                throw new Error("Invalid JSON received from AI model.");
+            }
+
+            const sanitized = sanitizeData(parsedData);
+            CacheManager.set(artist, song, sanitized);
+            
+            return sanitized;
         };
 
-        const generateImage = async (prompt) => {
-            const fallbackImage = "https://images.unsplash.com/photo-1511735111819-9a3f77e8cc48?q=80&w=2000&auto=format&fit=crop";
-            const activeApiKey = getApiKey();
+        // GRACEFUL DEGRADATION: Image generation is optional
+        const generateImage = async (prompt, onProgress) => {
+            const FALLBACK_IMAGES = [
+                "https://images.unsplash.com/photo-1511735111819-9a3f77e8cc48?q=80&w=2000&auto=format&fit=crop",
+                "https://images.unsplash.com/photo-1493225457124-a3eb161ffa5f?q=80&w=2000&auto=format&fit=crop",
+                "https://images.unsplash.com/photo-1514525253161-7a46d19cd819?q=80&w=2000&auto=format&fit=crop"
+            ];
             
-            if (!activeApiKey) return fallbackImage;
+            const getRandomFallback = () => FALLBACK_IMAGES[Math.floor(Math.random() * FALLBACK_IMAGES.length)];
+            
+            // If circuit breaker is OPEN, skip image generation entirely (Graceful Degradation)
+            const circuitStatus = CircuitBreaker.canRequest();
+            if (!circuitStatus.allowed) {
+                console.log('🎨 Skipping image generation (circuit open). Using fallback.');
+                onProgress?.('🎨 기본 이미지 사용 중...');
+                return getRandomFallback();
+            }
+            
+            // If low on tokens, skip image to preserve for text API
+            if (TokenBucket.tokens < 2) {
+                console.log('🎨 Skipping image generation (low tokens). Using fallback.');
+                onProgress?.('🎨 기본 이미지 사용 중...');
+                return getRandomFallback();
+            }
+
+            const activeApiKey = getApiKey();
+            if (!activeApiKey) return getRandomFallback();
 
             try {
-                // 연속 API 호출 방지 - 3초 대기
-                console.log('⏳ Waiting 3s before image generation...');
-                await wait(3000);
+                onProgress?.('🎨 이미지 생성 중...');
                 
-                // Rate Limiter 체크
-                await RateLimiter.waitIfNeeded();
-                
-                const response = await fetchWithRetry(
+                const response = await resilientFetch(
                     `https://generativelanguage.googleapis.com/v1beta/models/imagen-3.0-generate-001:generateImage?key=${activeApiKey}`,
                     {
                         method: 'POST',
@@ -339,27 +517,21 @@ Structure:
                             numberOfImages: 1,
                             aspectRatio: "16:9"
                         })
-                    }
+                    },
+                    1 // Only 1 retry for images
                 );
-
-                if (!response.ok) {
-                    console.warn("Image generation failed (likely billing/permission), using fallback.");
-                    return fallbackImage;
-                }
 
                 const data = await response.json();
                 const base64Image = data.images?.[0]?.image;
                 
-                if (!base64Image) return fallbackImage;
-                
-                return `data:image/png;base64,${base64Image}`;
+                return base64Image ? `data:image/png;base64,${base64Image}` : getRandomFallback();
             } catch (error) {
-                console.error("Image Generation Failed", error);
-                return fallbackImage;
+                console.warn("Image generation failed, using fallback:", error.message);
+                return getRandomFallback();
             }
         };
 
-        // --- Components ---
+        // --- UI Components ---
         const SectionTitle = ({ children, icon: Icon }) => (
             <h2 className="text-2xl md:text-3xl font-extrabold text-white mb-6 flex items-center gap-3 border-l-4 border-red-600 pl-4 uppercase tracking-widest">
                 {Icon && <Icon className="text-red-500 w-6 h-6 md:w-8 md:h-8" />}
@@ -369,7 +541,7 @@ Structure:
 
         const MarkdownText = ({ content }) => {
             if (typeof content !== 'string') {
-                return <p className="text-red-400 italic">Content format error: Unable to render text.</p>;
+                return <p className="text-red-400 italic">Content format error.</p>;
             }
 
             const formatText = (text) => {
@@ -402,6 +574,46 @@ Structure:
             );
         };
 
+        // Circuit Breaker Status Component
+        const CircuitBreakerStatus = ({ status, onReset }) => {
+            const [, forceUpdate] = useState(0);
+            
+            useEffect(() => {
+                if (status.state === 'OPEN') {
+                    const interval = setInterval(() => forceUpdate(n => n + 1), 1000);
+                    return () => clearInterval(interval);
+                }
+            }, [status.state]);
+            
+            if (status.state === 'CLOSED') return null;
+            
+            const remainingSeconds = Math.ceil(status.timeUntilRetry / 1000);
+            
+            return (
+                <div className="bg-yellow-900/30 border border-yellow-600/50 rounded-xl p-4 mb-6">
+                    <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-3">
+                            <Icons.AlertCircle className="w-6 h-6 text-yellow-500" />
+                            <div>
+                                <p className="text-yellow-400 font-bold">API 보호 모드 활성화</p>
+                                <p className="text-yellow-200/80 text-sm">
+                                    {status.state === 'OPEN' 
+                                        ? `Rate limit 초과로 ${remainingSeconds}초 후 자동 재시도됩니다.`
+                                        : '연결 테스트 중...'}
+                                </p>
+                            </div>
+                        </div>
+                        <button
+                            onClick={onReset}
+                            className="px-4 py-2 bg-yellow-600 hover:bg-yellow-500 text-white rounded-lg text-sm font-bold transition-colors"
+                        >
+                            수동 해제
+                        </button>
+                    </div>
+                </div>
+            );
+        };
+
         // --- Main App ---
         function App() {
             const [artist, setArtist] = useState('');
@@ -411,6 +623,15 @@ Structure:
             const [result, setResult] = useState(null);
             const [headerImage, setHeaderImage] = useState(null);
             const [error, setError] = useState(null);
+            const [circuitStatus, setCircuitStatus] = useState(CircuitBreaker.getStatus());
+            
+            // Update circuit status periodically
+            useEffect(() => {
+                const interval = setInterval(() => {
+                    setCircuitStatus(CircuitBreaker.getStatus());
+                }, 1000);
+                return () => clearInterval(interval);
+            }, []);
             
             const handleAnalyze = async (e) => {
                 e.preventDefault();
@@ -422,58 +643,70 @@ Structure:
                 setHeaderImage(null);
 
                 try {
-                    setStep('🎵 Analyzing song data & lyrics...');
-                    const analysisData = await generateContent(artist, song);
+                    const analysisData = await generateContent(artist, song, setStep);
                     setResult(analysisData);
 
-                    setStep('🎨 Generating atmospheric header image...');
-                    const imageUrl = await generateImage(analysisData.imagePrompt);
+                    const imageUrl = await generateImage(analysisData.imagePrompt, setStep);
                     setHeaderImage(imageUrl);
 
+                    setStep('✅ 완료!');
                 } catch (err) {
                     console.error('Analysis error:', err);
                     
-                    // User-friendly error messages
-                    if (err.message.includes('429') || err.message.includes('한도')) {
-                        setError('🚫 API 요청 한도 초과!\n\n무료 API는 분당 15회로 제한됩니다.\n\n해결 방법:\n1. 페이지를 새로고침하세요\n2. 1-2분 후 다시 시도하세요\n3. 같은 곡은 자동으로 캐시되어 재요청하지 않습니다\n\n💡 연속 검색 시 15초 간격을 두고 사용해주세요.');
+                    if (err.message === 'API_RATE_LIMIT') {
+                        setError('🚫 API 요청 한도 초과!\n\n2분 후 자동으로 재시도됩니다.\n또는 같은 곡을 다시 검색하면 캐시에서 로드됩니다.');
+                    } else if (err.message.includes('보호 모드')) {
+                        setError(err.message);
                     } else if (err.message.includes('API Key')) {
-                        setError('🔑 API 키 오류: 시스템 설정을 확인해주세요.');
+                        setError('🔑 API 키 오류');
                     } else {
-                        setError(err.message || "예상치 못한 오류가 발생했습니다. 잠시 후 다시 시도해주세요.");
+                        setError(err.message || "오류가 발생했습니다.");
                     }
                 } finally {
                     setLoading(false);
-                    setStep('');
+                    setTimeout(() => setStep(''), 2000);
+                    setCircuitStatus(CircuitBreaker.getStatus());
                 }
+            };
+            
+            const handleCircuitReset = () => {
+                CircuitBreaker.reset();
+                setCircuitStatus(CircuitBreaker.getStatus());
+                setError(null);
             };
 
             return (
                 <div className="min-h-screen bg-[#0d0d0d] text-[#f0f0f0] font-sans selection:bg-red-900 selection:text-white">
                     
-                    {/* Navigation / Brand */}
+                    {/* Navigation */}
                     <nav className="border-b border-gray-800 bg-[#111] sticky top-0 z-50 shadow-md">
                         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-20 flex items-center justify-between">
                             <div className="flex items-center gap-4">
-                                {/* Logo Image */}
                                 <div className="bg-black/50 p-2 rounded-lg border border-gray-800">
                                     <img 
                                         src="ZEROBIG_LOGO-20251225-003.png" 
                                         alt="ZEROBIG Logo" 
                                         className="h-10 w-auto object-contain brightness-125 contrast-125 drop-shadow-[0_0_8px_rgba(220,38,38,0.5)]" 
-                                        onError={(e) => {
-                                            e.currentTarget.style.display = 'none'; 
-                                        }}
+                                        onError={(e) => { e.currentTarget.style.display = 'none'; }}
                                     />
                                 </div>
-                                {/* Text Logo */}
                                 <div className="flex flex-col">
                                     <span className="font-black text-2xl tracking-tighter text-white leading-none">
                                         ZEORBIG <span className="text-red-600">METAL</span>
                                     </span>
                                     <span className="text-[0.65rem] text-gray-400 tracking-[0.3em] font-medium uppercase leading-tight">
-                                        Analysis Engine
+                                        Analysis Engine v2.0
                                     </span>
                                 </div>
+                            </div>
+                            
+                            {/* Token Status */}
+                            <div className="hidden md:flex items-center gap-2 text-xs text-gray-500">
+                                <span>🪙 {TokenBucket.tokens}/{TokenBucket.maxTokens}</span>
+                                <span className={`w-2 h-2 rounded-full ${
+                                    circuitStatus.state === 'CLOSED' ? 'bg-green-500' :
+                                    circuitStatus.state === 'HALF_OPEN' ? 'bg-yellow-500' : 'bg-red-500'
+                                }`}></span>
                             </div>
                         </div>
                     </nav>
@@ -492,6 +725,9 @@ Structure:
                                 </p>
                             </div>
 
+                            {/* Circuit Breaker Status */}
+                            <CircuitBreakerStatus status={circuitStatus} onReset={handleCircuitReset} />
+
                             <form onSubmit={handleAnalyze} className="bg-[#1a1a1a] p-6 md:p-8 rounded-2xl border border-gray-800 shadow-2xl shadow-black/50 backdrop-blur-sm">
                                 
                                 <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
@@ -504,6 +740,7 @@ Structure:
                                             placeholder="e.g. Metallica"
                                             className="w-full bg-[#0d0d0d] border border-gray-700 rounded-lg px-4 py-3 text-white placeholder-gray-600 focus:outline-none focus:ring-2 focus:ring-red-600 transition-all"
                                             required
+                                            disabled={loading}
                                         />
                                     </div>
                                     <div className="space-y-2">
@@ -515,19 +752,25 @@ Structure:
                                             placeholder="e.g. Master of Puppets"
                                             className="w-full bg-[#0d0d0d] border border-gray-700 rounded-lg px-4 py-3 text-white placeholder-gray-600 focus:outline-none focus:ring-2 focus:ring-red-600 transition-all"
                                             required
+                                            disabled={loading}
                                         />
                                     </div>
                                 </div>
                                 
                                 <button
                                     type="submit"
-                                    disabled={loading}
+                                    disabled={loading || circuitStatus.state === 'OPEN'}
                                     className="w-full bg-red-700 hover:bg-red-600 text-white font-bold py-4 px-8 rounded-lg transition-all transform hover:scale-[1.01] active:scale-[0.99] disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-3 shadow-[0_0_20px_rgba(220,38,38,0.3)]"
                                 >
                                     {loading ? (
                                         <>
                                             <Icons.Loader2 className="h-5 w-5" />
                                             <span>{step}</span>
+                                        </>
+                                    ) : circuitStatus.state === 'OPEN' ? (
+                                        <>
+                                            <Icons.AlertCircle className="h-5 w-5" />
+                                            <span>보호 모드 ({Math.ceil(circuitStatus.timeUntilRetry/1000)}초 후 활성화)</span>
                                         </>
                                     ) : (
                                         <>
@@ -536,146 +779,88 @@ Structure:
                                         </>
                                     )}
                                 </button>
-                                
-                                {error && (
-                                    <div className="mt-4 p-4 bg-red-900/20 border border-red-800/50 rounded-lg flex items-center gap-3 text-red-200">
-                                        <Icons.AlertCircle className="h-5 w-5 flex-shrink-0" />
-                                        <p>{error}</p>
-                                    </div>
-                                )}
                             </form>
+
+                            {/* Error Display */}
+                            {error && (
+                                <div className="mt-8 bg-red-900/30 border border-red-600/50 rounded-xl p-6 text-center animate-fade-in">
+                                    <Icons.AlertCircle className="w-12 h-12 text-red-500 mx-auto mb-4" />
+                                    <p className="text-red-300 whitespace-pre-line">{error}</p>
+                                </div>
+                            )}
                         </div>
                     </div>
 
                     {/* Results Section */}
                     {result && (
-                        <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-12 space-y-20 animate-fade-in">
-                            
-                            {/* Header Image & Walkthrough */}
-                            <section className="relative rounded-3xl overflow-hidden border border-gray-800 shadow-2xl">
-                                {headerImage ? (
-                                    <div className="relative h-[400px] md:h-[500px] w-full">
-                                        <img 
-                                            src={headerImage} 
-                                            alt="Generated Metal Art" 
-                                            className="w-full h-full object-cover"
-                                        />
-                                        <div className="absolute inset-0 bg-gradient-to-t from-[#0d0d0d] via-[#0d0d0d]/40 to-transparent"></div>
-                                        <div className="absolute bottom-0 left-0 p-8 md:p-12 max-w-4xl">
-                                            <h1 className="text-5xl md:text-7xl font-black text-white mb-2 drop-shadow-lg uppercase">{song}</h1>
-                                            <h2 className="text-2xl md:text-3xl font-bold text-red-500 mb-6 drop-shadow-md">{artist}</h2>
-                                            <div className="bg-black/60 backdrop-blur-md p-6 rounded-xl border border-white/10">
-                                                <p className="text-gray-200 text-lg leading-relaxed font-medium">
-                                                    {result.walkthrough}
-                                                </p>
-                                            </div>
-                                        </div>
-                                    </div>
-                                ) : (
-                                    <div className="h-64 bg-gray-800 flex items-center justify-center">
-                                        <Icons.Loader2 className="h-10 w-10 text-gray-500" />
-                                    </div>
-                                )}
-                            </section>
-
-                            {/* Lyrics Comparison */}
-                            <section>
-                                <SectionTitle icon={Icons.Mic2}>Lyrics Analysis</SectionTitle>
-                                <div className="grid grid-cols-1 md:grid-cols-2 gap-8 md:gap-12">
-                                    <div className="bg-[#151515] p-6 md:p-8 rounded-2xl border border-gray-800 hover:border-gray-700 transition-colors">
-                                        <div className="flex items-center gap-3 mb-6 pb-4 border-b border-gray-800">
-                                            <Icons.Globe className="text-gray-400 w-5 h-5" />
-                                            <h3 className="text-xl font-bold text-white">Original Lyrics</h3>
-                                        </div>
-                                        <div className="whitespace-pre-line text-gray-300 leading-8 font-serif text-lg opacity-90">
-                                            {result.lyricsOriginal}
-                                        </div>
-                                    </div>
-                                    <div className="bg-[#151515] p-6 md:p-8 rounded-2xl border border-gray-800 hover:border-gray-700 transition-colors">
-                                        <div className="flex items-center gap-3 mb-6 pb-4 border-b border-gray-800">
-                                            <Icons.FileText className="text-red-500 w-5 h-5" />
-                                            <h3 className="text-xl font-bold text-white">Korean Translation</h3>
-                                        </div>
-                                        <div className="whitespace-pre-line text-gray-100 leading-8 text-lg">
-                                            {result.lyricsKorean}
-                                        </div>
+                        <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-16 animate-fade-in">
+                            {/* Header Image */}
+                            {headerImage && (
+                                <div className="relative h-64 md:h-96 rounded-3xl overflow-hidden mb-16 shadow-2xl border border-gray-800">
+                                    <img src={headerImage} alt="Generated header" className="w-full h-full object-cover" />
+                                    <div className="absolute inset-0 bg-gradient-to-t from-[#0d0d0d] via-transparent to-transparent"></div>
+                                    <div className="absolute bottom-0 left-0 right-0 p-8">
+                                        <h2 className="text-4xl md:text-6xl font-black tracking-tight text-white drop-shadow-lg">{song}</h2>
+                                        <p className="text-2xl text-gray-300 font-semibold">{artist}</p>
                                     </div>
                                 </div>
+                            )}
+
+                            {/* Walkthrough */}
+                            {result.walkthrough && (
+                                <div className="bg-[#1a1a1a] border border-gray-800 rounded-2xl p-6 mb-12">
+                                    <MarkdownText content={result.walkthrough} />
+                                </div>
+                            )}
+
+                            {/* Main Grid */}
+                            <div className="grid grid-cols-1 lg:grid-cols-2 gap-8 mb-16">
+                                {/* Lyrics */}
+                                <section className="bg-[#1a1a1a] p-6 md:p-8 rounded-2xl border border-gray-800">
+                                    <SectionTitle icon={Icons.Mic2}>Original Lyrics</SectionTitle>
+                                    <pre className="whitespace-pre-wrap text-gray-400 font-mono text-sm leading-relaxed max-h-[500px] overflow-y-auto custom-scrollbar">{result.lyricsOriginal}</pre>
+                                </section>
+
+                                <section className="bg-[#1a1a1a] p-6 md:p-8 rounded-2xl border border-gray-800">
+                                    <SectionTitle icon={Icons.FileText}>한글 번역</SectionTitle>
+                                    <pre className="whitespace-pre-wrap text-gray-300 font-sans text-base leading-relaxed max-h-[500px] overflow-y-auto custom-scrollbar">{result.lyricsKorean}</pre>
+                                </section>
+                            </div>
+
+                            {/* Interpretation */}
+                            <section className="bg-[#1a1a1a] p-6 md:p-8 rounded-2xl border border-gray-800 mb-16">
+                                <SectionTitle icon={Icons.Sparkles}>곡 해석</SectionTitle>
+                                <MarkdownText content={result.songInterpretation} />
                             </section>
 
-                            {/* Song Interpretation */}
-                            <section>
-                                <SectionTitle icon={Icons.Music}>Deep Dive Interpretation</SectionTitle>
-                                <div className="bg-[#151515] p-8 md:p-10 rounded-2xl border border-gray-800 shadow-xl">
-                                    <MarkdownText content={result.songInterpretation} />
-                                </div>
+                            {/* Artist Info */}
+                            <section className="bg-[#1a1a1a] p-6 md:p-8 rounded-2xl border border-gray-800 mb-16">
+                                <SectionTitle icon={Icons.Info}>아티스트 정보</SectionTitle>
+                                <MarkdownText content={result.artistInfo} />
                             </section>
 
-                            {/* Artist Information & External Links */}
-                            <section className="grid grid-cols-1 lg:grid-cols-3 gap-8 pb-20">
-                                <div className="lg:col-span-2">
-                                    <SectionTitle icon={Icons.Info}>Artist Intelligence</SectionTitle>
-                                    <div className="bg-gradient-to-br from-[#151515] to-[#1a1a1a] p-8 md:p-10 rounded-2xl border border-gray-800 h-full">
-                                        <MarkdownText content={result.artistInfo} />
-                                    </div>
-                                </div>
-                                
-                                <div className="lg:col-span-1">
-                                    <SectionTitle icon={Icons.ExternalLink}>External Archives</SectionTitle>
-                                    <div className="flex flex-col gap-4">
-                                        
-                                        {/* Conditionally render Metal Archives links based on isMetal flag */}
-                                        {result.isMetal && (
-                                            <>
-                                                {result.externalLinks?.metalArchives ? (
-                                                    <ExternalLinkButton 
-                                                        href={result.externalLinks.metalArchives} 
-                                                        label="Metal Archives" 
-                                                        icon={Icons.Globe} 
-                                                        colorClass="bg-[#8b0000] hover:bg-[#a52a2a]"
-                                                    />
-                                                ) : (
-                                                    <div className="px-6 py-4 rounded-xl border border-dashed border-gray-700 text-gray-500 text-center text-sm">
-                                                        Metal Archives Not Found
-                                                    </div>
-                                                )}
-
-                                                {result.externalLinks?.metalMusicArchives && (
-                                                    <ExternalLinkButton 
-                                                        href={result.externalLinks.metalMusicArchives} 
-                                                        label="Metal Music Archives" 
-                                                        icon={Icons.Globe}
-                                                    />
-                                                )}
-                                            </>
-                                        )}
-
-                                        {/* Always show Wikipedia and YouTube */}
-                                        {result.externalLinks?.wikipedia && (
-                                            <ExternalLinkButton 
-                                                href={result.externalLinks.wikipedia} 
-                                                label="Wikipedia Entry" 
-                                                icon={Icons.Globe}
-                                                colorClass="bg-gray-700 hover:bg-gray-600"
-                                            />
-                                        )}
-
-                                        <ExternalLinkButton 
-                                            href={result.externalLinks?.youtube}
-                                            label="Watch on YouTube" 
-                                            icon={Icons.Youtube}
-                                            colorClass="bg-[#ff0000] hover:bg-[#cc0000]"
-                                        />
-                                    </div>
+                            {/* External Links */}
+                            <section className="mb-16">
+                                <SectionTitle icon={Icons.Globe}>External Resources</SectionTitle>
+                                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                    {result.isMetal && (
+                                        <>
+                                            <ExternalLinkButton href={result.externalLinks.metalArchives} label="Metal Archives" icon={Icons.Music} colorClass="bg-orange-900/50 hover:bg-orange-800/50" />
+                                            <ExternalLinkButton href={result.externalLinks.metalMusicArchives} label="Metal Music Archives" icon={Icons.Music} colorClass="bg-orange-800/50 hover:bg-orange-700/50" />
+                                        </>
+                                    )}
+                                    <ExternalLinkButton href={result.externalLinks.wikipedia} label="Wikipedia" icon={Icons.Globe} colorClass="bg-blue-900/50 hover:bg-blue-800/50" />
+                                    <ExternalLinkButton href={result.externalLinks.youtube} label="YouTube" icon={Icons.Youtube} colorClass="bg-red-900/50 hover:bg-red-800/50" />
                                 </div>
                             </section>
                         </main>
                     )}
 
                     {/* Footer */}
-                    <footer className="border-t border-gray-800 py-12 mt-12 bg-[#0a0a0a]">
-                        <div className="max-w-7xl mx-auto px-4 text-center">
-                            <p className="text-gray-500 mb-4">Powered by ZEORBIG Project</p>
+                    <footer className="border-t border-gray-800 bg-[#111] py-8">
+                        <div className="max-w-7xl mx-auto px-4 text-center text-gray-500 text-sm">
+                            <p>ZEORBIG Metal Analysis Engine v2.0 &copy; {new Date().getFullYear()}</p>
+                            <p className="mt-1">Powered by Gemini AI | Azure Well-Architected Framework</p>
                         </div>
                     </footer>
                 </div>
