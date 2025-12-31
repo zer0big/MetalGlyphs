@@ -79,10 +79,10 @@
             successCount: 0,
             lastFailureTime: 0,
             
-            // Configuration
-            FAILURE_THRESHOLD: 2,      // 2번 실패하면 OPEN
-            SUCCESS_THRESHOLD: 1,      // 1번 성공하면 CLOSED
-            TIMEOUT_MS: 120000,        // 2분 후 HALF_OPEN으로 전환
+            // Configuration - AGGRESSIVE PROTECTION
+            FAILURE_THRESHOLD: 1,      // 1번 실패하면 즉시 OPEN
+            SUCCESS_THRESHOLD: 2,      // 2번 성공해야 CLOSED
+            TIMEOUT_MS: 300000,        // 5분 후 HALF_OPEN으로 전환
             
             canRequest() {
                 const now = Date.now();
@@ -160,12 +160,12 @@
             }
         };
 
-        // 3. TOKEN BUCKET RATE LIMITER (More precise than simple interval)
+        // 3. TOKEN BUCKET RATE LIMITER - AGGRESSIVE PROTECTION
         const TokenBucket = {
-            tokens: 10,              // Max tokens
-            maxTokens: 10,
-            refillRate: 1,           // 1 token per 10 seconds
-            refillIntervalMs: 10000,
+            tokens: 2,               // Start with only 2 tokens
+            maxTokens: 3,            // Max 3 tokens
+            refillRate: 1,           // 1 token per 60 seconds
+            refillIntervalMs: 60000, // 60초 간격
             lastRefillTime: Date.now(),
             
             refill() {
@@ -476,16 +476,25 @@ Structure:
             return sanitized;
         };
 
-        // GRACEFUL DEGRADATION: Image generation is optional
+        // GRACEFUL DEGRADATION: Image generation DISABLED to prevent 429
+        // 이미지 생성은 완전히 비활성화하고 항상 fallback 사용
         const generateImage = async (prompt, onProgress) => {
             const FALLBACK_IMAGES = [
                 "https://images.unsplash.com/photo-1511735111819-9a3f77e8cc48?q=80&w=2000&auto=format&fit=crop",
                 "https://images.unsplash.com/photo-1493225457124-a3eb161ffa5f?q=80&w=2000&auto=format&fit=crop",
-                "https://images.unsplash.com/photo-1514525253161-7a46d19cd819?q=80&w=2000&auto=format&fit=crop"
+                "https://images.unsplash.com/photo-1514525253161-7a46d19cd819?q=80&w=2000&auto=format&fit=crop",
+                "https://images.unsplash.com/photo-1470229722913-7c0e2dbbafd3?q=80&w=2000&auto=format&fit=crop",
+                "https://images.unsplash.com/photo-1508252592163-5d3c3c559f36?q=80&w=2000&auto=format&fit=crop"
             ];
             
             const getRandomFallback = () => FALLBACK_IMAGES[Math.floor(Math.random() * FALLBACK_IMAGES.length)];
             
+            // ALWAYS use fallback - Image API disabled to preserve rate limit
+            console.log('🎨 Image API disabled. Using high-quality fallback.');
+            onProgress?.('🎨 이미지 로드 중...');
+            return getRandomFallback();
+            
+            /* DISABLED - Image generation causes too many 429 errors
             // If circuit breaker is OPEN, skip image generation entirely (Graceful Degradation)
             const circuitStatus = CircuitBreaker.canRequest();
             if (!circuitStatus.allowed) {
@@ -500,6 +509,7 @@ Structure:
                 onProgress?.('🎨 기본 이미지 사용 중...');
                 return getRandomFallback();
             }
+            */
 
             const activeApiKey = getApiKey();
             if (!activeApiKey) return getRandomFallback();
