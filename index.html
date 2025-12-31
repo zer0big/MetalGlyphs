@@ -63,12 +63,9 @@
         // AZURE WELL-ARCHITECTED FRAMEWORK - RELIABILITY PATTERNS
         // ============================================================
 
-        // 1. AZURE OPENAI CONFIGURATION
-        const AZURE_OPENAI_CONFIG = {
-            endpoint: 'https://zerobig-aoi.openai.azure.com',
-            apiKey: '18a97f5864e24ee2ac9e5b7050803e1a',
-            deploymentName: 'gpt-4o',
-            apiVersion: '2024-02-15-preview'
+        // 1. API CONFIGURATION - API 키는 서버측에서 보안 관리
+        const API_CONFIG = {
+            analyzeEndpoint: '/api/analyze'  // Azure Static Web Apps 내장 Functions
         };
 
         // 2. CIRCUIT BREAKER PATTERN (Azure WAF RE:07 Self-preservation)
@@ -376,7 +373,7 @@
             throw lastError;
         };
 
-        // 8. MAIN API FUNCTIONS
+        // 8. MAIN API FUNCTIONS - API 프록시를 통해 호출 (키 보안)
         const generateContent = async (artist, song, onProgress) => {
             // Check cache first
             const cached = CacheManager.get(artist, song);
@@ -393,85 +390,26 @@
 
             onProgress?.('🎵 Azure OpenAI 분석 중...');
 
-            const systemPrompt = `
-You are the "ZEORBIG Metal Analysis Engine". Your goal is to analyze a song and provide structured data.
-
-Perform the following steps based on the user's Artist Name and Song Title:
-
-1. **Genre Check**: Determine if this artist/song is primarily Metal or a Metal subgenre (e.g., Thrash, Death, Power, Heavy Metal). Set "isMetal" boolean accordingly.
-2. **Get Original Lyrics**: Retrieve the full, original English lyrics.
-3. **Translate Lyrics**: Translate these lyrics into fluent, emotional Korean.
-4. **Artist Info**: Retrieve the artist's discography/bio and translate it into natural Korean (keep proper nouns in English).
-5. **Song Interpretation**: Analyze the song's meaning, themes, and context. Explain it in Korean using Markdown.
-6. **Walkthrough**: Write a brief Korean intro guiding the user through the content.
-7. **Image Prompt**: Create a vivid, dynamic English image prompt for a header image. If Metal, use dark/gritty metal aesthetic. If not Metal, use an aesthetic appropriate for the genre.
-8. **External Links**: 
-   - **Metal Archives**: ONLY if "isMetal" is true, find the URL on 'metal-archives.com'. Otherwise set to null.
-   - **Metal Music Archives**: ONLY if "isMetal" is true, find the URL on 'metalmusicarchives.com'. Otherwise set to null.
-   - **Wikipedia**: Provide a relevant Wikipedia URL.
-   - **YouTube**: Generate a YouTube search URL for the song.
-
-**CRITICAL OUTPUT INSTRUCTION**:
-Output strictly valid JSON. No markdown formatting.
-Structure:
-{
-  "isMetal": boolean,
-  "lyricsOriginal": "String",
-  "lyricsKorean": "String",
-  "artistInfo": "String",
-  "songInterpretation": "String",
-  "walkthrough": "String",
-  "imagePrompt": "String",
-  "externalLinks": {
-    "metalArchives": "URL String or null",
-    "metalMusicArchives": "URL String or null",
-    "wikipedia": "URL String or null",
-    "youtube": "URL String"
-  }
-}
-            `;
-
+            // API 프록시를 통해 호출 - API 키는 서버측에서 안전하게 관리
             const response = await resilientFetch(
-                `${AZURE_OPENAI_CONFIG.endpoint}/openai/deployments/${AZURE_OPENAI_CONFIG.deploymentName}/chat/completions?api-version=${AZURE_OPENAI_CONFIG.apiVersion}`,
+                API_CONFIG.analyzeEndpoint,
                 {
                     method: 'POST',
                     headers: { 
-                        'Content-Type': 'application/json',
-                        'api-key': AZURE_OPENAI_CONFIG.apiKey
+                        'Content-Type': 'application/json'
                     },
-                    body: JSON.stringify({
-                        messages: [
-                            { role: 'system', content: systemPrompt },
-                            { role: 'user', content: `Artist: ${artist}, Song: ${song}` }
-                        ],
-                        temperature: 0.7,
-                        max_tokens: 4000
-                    })
+                    body: JSON.stringify({ artist, song })
                 }
             );
 
             const data = await response.json();
-            let textContent = data.choices?.[0]?.message?.content;
             
-            if (!textContent) throw new Error("No content generated");
-
-            const jsonStart = textContent.indexOf('{');
-            const jsonEnd = textContent.lastIndexOf('}');
-            
-            if (jsonStart !== -1 && jsonEnd !== -1) {
-                textContent = textContent.substring(jsonStart, jsonEnd + 1);
-            } else {
-                throw new Error("Failed to parse JSON from model response.");
-            }
-            
-            let parsedData;
-            try {
-                parsedData = JSON.parse(textContent);
-            } catch (e) {
-                throw new Error("Invalid JSON received from AI model.");
+            // API 프록시에서 이미 파싱된 데이터 반환
+            if (data.error) {
+                throw new Error(data.error);
             }
 
-            const sanitized = sanitizeData(parsedData);
+            const sanitized = sanitizeData(data);
             CacheManager.set(artist, song, sanitized);
             
             return sanitized;
@@ -871,7 +809,7 @@ Structure:
                     <footer className="border-t border-gray-800 bg-[#111] py-8">
                         <div className="max-w-7xl mx-auto px-4 text-center text-gray-500 text-sm">
                             <p>ZEORBIG Metal Analysis Engine v2.0 &copy; {new Date().getFullYear()}</p>
-                            <p className="mt-1">Powered by Gemini AI | Azure Well-Architected Framework</p>
+                            <p className="mt-1">Powered by Azure OpenAI | Azure Well-Architected Framework</p>
                         </div>
                     </footer>
                 </div>

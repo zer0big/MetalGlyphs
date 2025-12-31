@@ -1,0 +1,8 @@
+{
+  "name": "metalglyphs-api",
+  "version": "1.0.0",
+  "description": "Azure Functions API Proxy for MetalGlyphs",
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
