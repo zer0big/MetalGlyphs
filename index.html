@@ -437,14 +437,14 @@ Structure:
             `;
 
             const response = await resilientFetch(
-                `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=${activeApiKey}`,
+                `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${activeApiKey}`,
                 {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
                         contents: [{ parts: [{ text: `Artist: ${artist}, Song: ${song}` }] }],
-                        systemInstruction: { parts: [{ text: systemPrompt }] },
-                        tools: [{ google_search: {} }]
+                        systemInstruction: { parts: [{ text: systemPrompt }] }
+                        // google_search removed to reduce API complexity and rate limiting
                     })
                 }
             );
