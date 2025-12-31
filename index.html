@@ -108,18 +108,38 @@
 
         const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-        const fetchWithRetry = async (url, options, retries = 5, delay = 1000) => {
+        const fetchWithRetry = async (url, options, retries = 5, delay = 2000) => {
             try {
                 const response = await fetch(url, options);
                 
-                if (!response.ok && (response.status >= 500 || response.status === 429)) {
+                if (response.status === 429) {
+                    // Rate limit error - longer wait time
+                    const retryAfter = response.headers.get('Retry-After');
+                    const waitTime = retryAfter ? parseInt(retryAfter) * 1000 : delay;
+                    
+                    if (retries === 0) {
+                        throw new Error(`⚠️ API 요청 한도 초과 (429): 잠시 후 다시 시도해주세요. (${Math.round(waitTime/1000)}초 대기 필요)`);
+                    }
+                    
+                    console.log(`Rate limit hit, waiting ${waitTime}ms before retry...`);
+                    await wait(waitTime);
+                    return fetchWithRetry(url, options, retries - 1, Math.min(delay * 2, 30000)); // Max 30s
+                }
+                
+                if (!response.ok && response.status >= 500) {
                     throw new Error(`Server error: ${response.status}`);
                 }
+                
                 return response;
             } catch (error) {
                 if (retries === 0) throw error;
-                await wait(delay);
-                return fetchWithRetry(url, options, retries - 1, delay * 2);
+                
+                // For network errors or other issues
+                if (!error.message.includes('429')) {
+                    await wait(delay);
+                    return fetchWithRetry(url, options, retries - 1, delay * 1.5);
+                }
+                throw error; // Re-throw 429 errors
             }
         };
 
@@ -233,6 +253,9 @@ Structure:
             if (!activeApiKey) return fallbackImage;
 
             try {
+                // Add delay to avoid hitting rate limit after generateContent
+                await wait(1000);
+                
                 const response = await fetchWithRetry(
                     `https://generativelanguage.googleapis.com/v1beta/models/imagen-3.0-generate-001:generateImage?key=${activeApiKey}`,
                     {
@@ -326,16 +349,25 @@ Structure:
                 setHeaderImage(null);
 
                 try {
-                    setStep('Analyzing song data & lyrics...');
+                    setStep('🎵 Analyzing song data & lyrics...');
                     const analysisData = await generateContent(artist, song);
                     setResult(analysisData);
 
-                    setStep('Generating atmospheric header image...');
+                    setStep('🎨 Generating atmospheric header image...');
                     const imageUrl = await generateImage(analysisData.imagePrompt);
                     setHeaderImage(imageUrl);
 
                 } catch (err) {
-                    setError(err.message || "An unexpected error occurred. Please try again.");
+                    console.error('Analysis error:', err);
+                    
+                    // User-friendly error messages
+                    if (err.message.includes('429')) {
+                        setError('⚠️ API 요청 한도 초과: 잠시 후(1-2분) 다시 시도해주세요. 무료 API는 분당 요청 수가 제한됩니다.');
+                    } else if (err.message.includes('API Key')) {
+                        setError('🔑 API 키 오류: 시스템 설정을 확인해주세요.');
+                    } else {
+                        setError(err.message || "예상치 못한 오류가 발생했습니다. 잠시 후 다시 시도해주세요.");
+                    }
                 } finally {
                     setLoading(false);
                     setStep('');
