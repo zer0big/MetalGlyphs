@@ -70,6 +70,60 @@
             return "AIzaSyBwJ7Oxw1VYAXi6dsXpP1iA3qwb5Aw8OuQ";
         };
 
+        // Rate Limiter - 429 에러 방지를 위한 전역 API 호출 제한
+        const RateLimiter = {
+            lastCallTime: 0,
+            minInterval: 15000, // 최소 15초 간격
+            
+            async waitIfNeeded() {
+                const now = Date.now();
+                const timeSinceLastCall = now - this.lastCallTime;
+                
+                if (timeSinceLastCall < this.minInterval) {
+                    const waitTime = this.minInterval - timeSinceLastCall;
+                    console.log(`⏱️ Rate limit protection: waiting ${Math.round(waitTime/1000)}s before API call...`);
+                    await wait(waitTime);
+                }
+                
+                this.lastCallTime = Date.now();
+            }
+        };
+
+        // Cache Manager - 중복 요청 방지
+        const CacheManager = {
+            get(key) {
+                try {
+                    const cached = localStorage.getItem(`metal_cache_${key}`);
+                    if (!cached) return null;
+                    
+                    const data = JSON.parse(cached);
+                    const age = Date.now() - data.timestamp;
+                    
+                    // 1시간 캐시
+                    if (age < 3600000) {
+                        console.log('✅ Using cached result');
+                        return data.value;
+                    }
+                    
+                    localStorage.removeItem(`metal_cache_${key}`);
+                } catch (e) {
+                    console.error('Cache read error:', e);
+                }
+                return null;
+            },
+            
+            set(key, value) {
+                try {
+                    localStorage.setItem(`metal_cache_${key}`, JSON.stringify({
+                        value,
+                        timestamp: Date.now()
+                    }));
+                } catch (e) {
+                    console.error('Cache write error:', e);
+                }
+            }
+        };
+
         // --- Helper Functions ---
         const sanitizeData = (raw) => {
             const asString = (val, defaultText = "") => {
@@ -108,22 +162,22 @@
 
         const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-        const fetchWithRetry = async (url, options, retries = 5, delay = 2000) => {
+        const fetchWithRetry = async (url, options, retries = 3, delay = 5000) => {
             try {
                 const response = await fetch(url, options);
                 
                 if (response.status === 429) {
-                    // Rate limit error - longer wait time
+                    // Rate limit error - MUCH longer wait time
                     const retryAfter = response.headers.get('Retry-After');
-                    const waitTime = retryAfter ? parseInt(retryAfter) * 1000 : delay;
+                    const waitTime = retryAfter ? parseInt(retryAfter) * 1000 : Math.max(delay, 60000); // 최소 60초
                     
                     if (retries === 0) {
-                        throw new Error(`⚠️ API 요청 한도 초과 (429): 잠시 후 다시 시도해주세요. (${Math.round(waitTime/1000)}초 대기 필요)`);
+                        throw new Error(`🚫 API 요청 한도 초과: Google API의 무료 티어 한도에 도달했습니다. ${Math.round(waitTime/1000)}초 후 다시 시도하거나, 잠시 후 새로고침 해주세요.`);
                     }
                     
-                    console.log(`Rate limit hit, waiting ${waitTime}ms before retry...`);
+                    console.warn(`⚠️ 429 Rate limit! Waiting ${Math.round(waitTime/1000)}s...`);
                     await wait(waitTime);
-                    return fetchWithRetry(url, options, retries - 1, Math.min(delay * 2, 30000)); // Max 30s
+                    return fetchWithRetry(url, options, retries - 1, waitTime * 1.5);
                 }
                 
                 if (!response.ok && response.status >= 500) {
@@ -135,9 +189,9 @@
                 if (retries === 0) throw error;
                 
                 // For network errors or other issues
-                if (!error.message.includes('429')) {
+                if (!error.message.includes('429') && !error.message.includes('한도')) {
                     await wait(delay);
-                    return fetchWithRetry(url, options, retries - 1, delay * 1.5);
+                    return fetchWithRetry(url, options, retries - 1, delay * 2);
                 }
                 throw error; // Re-throw 429 errors
             }
@@ -149,6 +203,16 @@
             if (!activeApiKey) {
                 throw new Error("API Key is missing. Please check system configuration.");
             }
+
+            // 캐시 확인
+            const cacheKey = `${artist.toLowerCase()}_${song.toLowerCase()}`;
+            const cached = CacheManager.get(cacheKey);
+            if (cached) {
+                return cached;
+            }
+
+            // Rate Limiter 체크
+            await RateLimiter.waitIfNeeded();
 
             const systemPrompt = `
 You are the "ZEORBIG Metal Analysis Engine". Your goal is to analyze a song and provide structured data.
@@ -238,7 +302,12 @@ Structure:
                     throw new Error("Invalid JSON received from AI model.");
                 }
 
-                return sanitizeData(parsedData);
+                const sanitized = sanitizeData(parsedData);
+                
+                // 결과 캐싱
+                CacheManager.set(cacheKey, sanitized);
+                
+                return sanitized;
 
             } catch (error) {
                 console.error("Text Generation Failed", error);
@@ -253,8 +322,12 @@ Structure:
             if (!activeApiKey) return fallbackImage;
 
             try {
-                // Add delay to avoid hitting rate limit after generateContent
-                await wait(1000);
+                // 연속 API 호출 방지 - 3초 대기
+                console.log('⏳ Waiting 3s before image generation...');
+                await wait(3000);
+                
+                // Rate Limiter 체크
+                await RateLimiter.waitIfNeeded();
                 
                 const response = await fetchWithRetry(
                     `https://generativelanguage.googleapis.com/v1beta/models/imagen-3.0-generate-001:generateImage?key=${activeApiKey}`,
@@ -361,8 +434,8 @@ Structure:
                     console.error('Analysis error:', err);
                     
                     // User-friendly error messages
-                    if (err.message.includes('429')) {
-                        setError('⚠️ API 요청 한도 초과: 잠시 후(1-2분) 다시 시도해주세요. 무료 API는 분당 요청 수가 제한됩니다.');
+                    if (err.message.includes('429') || err.message.includes('한도')) {
+                        setError('🚫 API 요청 한도 초과!\n\n무료 API는 분당 15회로 제한됩니다.\n\n해결 방법:\n1. 페이지를 새로고침하세요\n2. 1-2분 후 다시 시도하세요\n3. 같은 곡은 자동으로 캐시되어 재요청하지 않습니다\n\n💡 연속 검색 시 15초 간격을 두고 사용해주세요.');
                     } else if (err.message.includes('API Key')) {
                         setError('🔑 API 키 오류: 시스템 설정을 확인해주세요.');
                     } else {
